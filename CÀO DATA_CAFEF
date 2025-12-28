@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CafeF history crawler (SELENIUM) -> parse table by date-like column -> save Excel.
+- Read symbols from vietstock_200_symbols.xlsx (sheet: symbols, col: symbol)
+- Crawl CafeF history by date range + pagination
+- Save partial at 50 symbols with data
+"""
+
+import re
+import time
+import random
+from io import StringIO
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
+
+# ================== CONFIG ==================
+SYMBOLS_XLSX = "vietstock_200_symbols.xlsx"
+SYMBOLS_SHEET = "symbols"
+SYMBOL_COL = "symbol"
+
+OUT_XLSX = "cafef_history_10k.xlsx"
+PARTIAL_XLSX = "cafef_history_50symbols_partial.xlsx"
+
+START_DATE = "2024-01-01"
+END_DATE = "2024-12-31"
+
+MAX_PAGES_PER_SYMBOL = 30
+TARGET_ROWS = 10_000
+SAVE_PARTIAL_AT_SYMBOLS = 50
+
+PAGELOAD_TIMEOUT = 35
+WAIT_TABLE_TIMEOUT = 20
+
+CAFEF_URL_TMPL = (
+    "https://cafef.vn/du-lieu/lich-su-giao-dich-symbol-{symbol}/"
+    "trang-{page}-0-tab-1-d1-{d1}-d2-{d2}.chn"
+)
+
+# dd/mm/yyyy (hoặc d/m/yy)
+DATE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
+
+
+# ================== HELPERS ==================
+def fmt_cafef_date(iso_date: str) -> str:
+    d = datetime.strptime(iso_date, "%Y-%m-%d")
+    return d.strftime("%d_%m_%Y")
+
+
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # MultiIndex -> flatten
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            " ".join([str(x).strip() for x in tup if str(x).strip().lower() != "nan"]).strip()
+            for tup in df.columns.values
+        ]
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # drop Unnamed columns
+    mask_unnamed = pd.Series(df.columns).str.contains(r"^Unnamed", case=False, na=False).values
+    if mask_unnamed.any():
+        df = df.loc[:, ~mask_unnamed]
+
+    # drop all-NaN columns
+    df = df.dropna(axis=1, how="all")
+    return df
+
+
+def table_date_hits(df: pd.DataFrame) -> int:
+    """Đếm số ô giống ngày dd/mm/yyyy ở cột bất kỳ (ưu tiên cột 0)."""
+    df = clean_columns(df)
+    if df.empty:
+        return 0
+
+    sample = df.head(35).astype(str)
+
+    # ưu tiên cột đầu
+    hits = 0
+    col0 = sample.iloc[:, 0].tolist()
+    hits0 = sum(1 for v in col0 if DATE_RE.match(v))
+    hits = max(hits, hits0)
+
+    # nếu cột đầu không phải ngày thì thử các cột khác
+    for j in range(min(sample.shape[1], 8)):
+        colj = sample.iloc[:, j].tolist()
+        hitsj = sum(1 for v in colj if DATE_RE.match(v))
+hits = max(hits, hitsj)
+
+    return hits
+
+
+def pick_history_table_from_html(html: str) -> pd.DataFrame:
+    """
+    CafeF có thể có nhiều bảng (tin tức/menu).
+    Chọn bảng có nhiều dòng ngày dd/mm/yyyy nhất.
+    """
+    try:
+        dfs = pd.read_html(StringIO(html))
+    except ValueError:
+        return pd.DataFrame()
+
+    if not dfs:
+        return pd.DataFrame()
+
+    best_df = pd.DataFrame()
+    best_hits = 0
+
+    for df in dfs:
+        df2 = clean_columns(df)
+        hits = table_date_hits(df2)
+        if hits > best_hits:
+            best_hits = hits
+            best_df = df2
+
+    # cần ít nhất vài dòng ngày thì mới tin là bảng lịch sử giao dịch
+    if best_hits < 3:
+        return pd.DataFrame()
+
+    return best_df
+
+
+def build_driver(headless: bool = True):
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--lang=vi-VN")
+
+    # giảm bị detect (không đảm bảo 100% nhưng đỡ hơn)
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
+    return driver
+
+
+# ================== CRAWL ==================
+def crawl_symbol_selenium(driver, symbol: str, start_date: str, end_date: str, max_pages: int):
+    d1, d2 = fmt_cafef_date(start_date), fmt_cafef_date(end_date)
+    frames = []
+
+    for page in range(1, max_pages + 1):
+        url = CAFEF_URL_TMPL.format(symbol=symbol.lower(), page=page, d1=d1, d2=d2)
+
+        try:
+            driver.get(url)
+        except TimeoutException:
+            # trang load lâu: cứ lấy page_source hiện tại thử parse
+            pass
+        except WebDriverException:
+            break
+
+        # đợi có ít nhất 1 table xuất hiện
+        try:
+            WebDriverWait(driver, WAIT_TABLE_TIMEOUT).until(
+                EC.presence_of_element_located((By.TAG_NAME, "table"))
+            )
+        except TimeoutException:
+            # không có bảng => break
+            break
+
+        html = driver.page_source
+        df = pick_history_table_from_html(html)
+
+        if df.empty:
+            # nếu page 1 đã empty => thường là bị chặn/JS lỗi => dừng luôn
+            break
+
+        df["symbol"] = symbol.upper()
+        df["page"] = page
+        df["source_url"] = url
+        frames.append(df)
+
+        time.sleep(random.uniform(0.8, 1.6))
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def main():
+    # tìm file symbols
+    p = Path(SYMBOLS_XLSX)
+    if not p.exists():
+        try:
+p2 = Path(__file__).resolve().parent / SYMBOLS_XLSX
+            if p2.exists():
+                p = p2
+        except NameError:
+            pass
+
+    if not p.exists():
+        raise FileNotFoundError(f"Không thấy file {SYMBOLS_XLSX}. Hiện đang ở: {Path.cwd()}")
+
+    symbols_df = pd.read_excel(p, sheet_name=SYMBOLS_SHEET)
+    symbols = symbols_df[SYMBOL_COL].dropna().astype(str).unique().tolist()
+
+    driver = build_driver(headless=False)  # headless=False để Nhím thấy nó chạy (có thể đổi True)
+
+    all_frames = []
+    total_rows = 0
+    symbols_with_data = 0
+
+    try:
+        for i, sym in enumerate(symbols, 1):
+            df = crawl_symbol_selenium(driver, sym, START_DATE, END_DATE, MAX_PAGES_PER_SYMBOL)
+            n = len(df)
+            print(f"[{i}/{len(symbols)}] {sym}: {n} rows")
+
+            if n == 0:
+                # nghỉ lâu hơn chút để đỡ bị chặn
+                time.sleep(random.uniform(1.2, 2.2))
+                continue
+
+            all_frames.append(df)
+            total_rows += n
+            symbols_with_data += 1
+            print(f"   symbols_with_data={symbols_with_data} | total_rows={total_rows}")
+
+            # save partial when enough symbols
+            if symbols_with_data == SAVE_PARTIAL_AT_SYMBOLS:
+                df_tmp = clean_columns(pd.concat(all_frames, ignore_index=True))
+                df_tmp.to_excel(PARTIAL_XLSX, index=False)
+                print(f">> SAVED partial: {PARTIAL_XLSX} | rows={len(df_tmp)}")
+
+            if total_rows >= TARGET_ROWS:
+                break
+
+            time.sleep(random.uniform(0.8, 1.8))
+
+    finally:
+        driver.quit()
+
+    if not all_frames:
+        raise RuntimeError("Không lấy được dòng nào từ CafeF. Có thể CafeF chặn mạnh hoặc URL đổi format.")
+
+    df_all = clean_columns(pd.concat(all_frames, ignore_index=True))
+    if len(df_all) > TARGET_ROWS:
+        df_all = df_all.iloc[:TARGET_ROWS].copy()
+
+    df_all.to_excel(OUT_XLSX, index=False)
+    print("Saved:", OUT_XLSX, "| rows =", len(df_all))
+
+
+if __name__ == "__main__":
+    main()
