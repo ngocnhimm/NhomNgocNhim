@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec 29 08:26:08 2025
+
+@author: admin
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re
+import time
+import random
+import hashlib
+from io import StringIO
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import BulkWriteError
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
+
+# ================== CONFIG ==================
+SYMBOLS_XLSX = "vietstock_200_symbols.xlsx"
+SYMBOLS_SHEET = "symbols"
+SYMBOL_COL = "symbol"
+
+START_DATE = "2024-01-01"
+END_DATE = "2024-12-31"
+MAX_PAGES_PER_SYMBOL = 30
+
+PAGELOAD_TIMEOUT = 35
+WAIT_TABLE_TIMEOUT = 20
+
+CAFEF_URL_TMPL = (
+    "https://cafef.vn/du-lieu/lich-su-giao-dich-symbol-{symbol}/"
+    "trang-{page}-0-tab-1-d1-{d1}-d2-{d2}.chn"
+)
+
+DATE_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
+
+# ===== MongoDB (Nhím sửa lại cho đúng) =====
+MONGO_URI = "mongodb+srv://ngochienvo05_db_user:ngocnhim@cluster0.4grijbx.mongodb.net/?retryWrites=true&w=majority"
+MONGO_DB = "CHUNG_KHOAN"
+MONGO_COLL = "cafef_history"
+
+
+# ================== HELPERS ==================
+def fmt_cafef_date(iso_date: str) -> str:
+    d = datetime.strptime(iso_date, "%Y-%m-%d")
+    return d.strftime("%d_%m_%Y")
+
+
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            " ".join([str(x).strip() for x in tup if str(x).strip().lower() != "nan"]).strip()
+            for tup in df.columns.values
+        ]
+
+    df.columns = [str(c).strip() for c in df.columns]
+    mask_unnamed = pd.Series(df.columns).str.contains(r"^Unnamed", case=False, na=False).values
+    if mask_unnamed.any():
+        df = df.loc[:, ~mask_unnamed]
+
+    df = df.dropna(axis=1, how="all")
+    return df
+
+
+def table_date_hits(df: pd.DataFrame) -> int:
+    df = clean_columns(df)
+    if df.empty:
+        return 0
+
+    sample = df.head(40).astype(str)
+    best = 0
+    for j in range(min(sample.shape[1], 10)):
+        colj = sample.iloc[:, j].tolist()
+        hits = sum(1 for v in colj if DATE_RE.match(v))
+        best = max(best, hits)
+    return best
+
+
+def pick_history_table_from_html(html: str) -> pd.DataFrame:
+    try:
+        dfs = pd.read_html(StringIO(html))
+    except ValueError:
+        return pd.DataFrame()
+
+    if not dfs:
+        return pd.DataFrame()
+
+    best_df = pd.DataFrame()
+    best_hits = 0
+
+    for df in dfs:
+        df2 = clean_columns(df)
+        hits = table_date_hits(df2)
+        if hits > best_hits:
+            best_hits = hits
+            best_df = df2
+
+    if best_hits < 3:
+        return pd.DataFrame()
+
+    return best_df
+
+
+def build_driver(headless: bool = True):
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--lang=vi-VN")
+
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.set_page_load_timeout(PAGELOAD_TIMEOUT)
+    return driver
+
+
+def resolve_symbols_file(path_str: str) -> Path:
+    p = Path(path_str)
+    if p.exists():
+        return p
+    try:
+        p2 = Path(__file__).resolve().parent / path_str
+        if p2.exists():
+            return p2
+    except NameError:
+        pass
+    raise FileNotFoundError(f"Không thấy file {path_str}. Hiện đang ở: {Path.cwd()}")
+
+
+def make_doc_id(symbol: str, row: dict) -> str:
+    """
+    Tạo _id ổn định để tránh trùng khi chạy lại.
+    Lấy symbol + ngày + vài cột giá/khối lượng (nếu có) + source_url.
+    """
+    date_val = ""
+    # cố lấy "Ngày" (hoặc cột đầu) làm date
+    if "Ngày" in row:
+        date_val = str(row.get("Ngày", "")).strip()
+    else:
+        # fallback: thử key đầu tiên
+        if row:
+            first_key = list(row.keys())[0]
+            date_val = str(row.get(first_key, "")).strip()
+
+    raw = f"{symbol}|{date_val}|{row.get('source_url','')}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+# ================== MONGO ==================
+def get_collection():
+    client = MongoClient(MONGO_URI)
+    coll = client[MONGO_DB][MONGO_COLL]
+
+    # unique index theo _id (mặc định đã unique), nhưng tạo thêm index hỗ trợ query:
+    coll.create_index([("symbol", 1), ("date", 1)])
+    return coll
+
+
+def df_to_docs(df: pd.DataFrame, symbol: str, page: int, url: str):
+    df = clean_columns(df)
+    if df.empty:
+        return []
+
+    records = df.to_dict(orient="records")
+    docs = []
+
+    for r in records:
+        r = {str(k).strip(): v for k, v in r.items()}
+
+        # cố map date
+        date_val = None
+        if "Ngày" in r:
+            date_val = str(r.get("Ngày", "")).strip()
+        else:
+            # fallback: cột 0
+            if len(r) > 0:
+                date_val = str(list(r.values())[0]).strip()
+
+        doc = {
+            **r,
+            "symbol": symbol.upper(),
+            "page": page,
+            "source_url": url,
+            "date": date_val,
+        }
+        doc["_id"] = make_doc_id(symbol.upper(), doc)
+        docs.append(doc)
+
+    return docs
+
+
+def upsert_many(coll, docs):
+    if not docs:
+        return 0, 0
+
+    ops = [UpdateOne({"_id": d["_id"]}, {"$setOnInsert": d}, upsert=True) for d in docs]
+
+    try:
+        res = coll.bulk_write(ops, ordered=False)
+        # inserted = upserted_count
+        inserted = res.upserted_count
+        # duplicates ~ total - inserted (ước lượng)
+        dup = len(docs) - inserted
+        return inserted, dup
+    except BulkWriteError as e:
+        # nếu có lỗi lặt vặt, vẫn cố tính
+        inserted = e.details.get("nUpserted", 0)
+        dup = len(docs) - inserted
+        return inserted, dup
+
+
+# ================== CRAWL ==================
+def crawl_symbol_pages(driver, symbol: str, start_date: str, end_date: str, max_pages: int, coll):
+    d1, d2 = fmt_cafef_date(start_date), fmt_cafef_date(end_date)
+
+    inserted_total = 0
+    dup_total = 0
+    got_any = False
+
+    for page in range(1, max_pages + 1):
+        url = CAFEF_URL_TMPL.format(symbol=symbol.lower(), page=page, d1=d1, d2=d2)
+
+        try:
+            driver.get(url)
+        except TimeoutException:
+            pass
+        except WebDriverException:
+            break
+
+        try:
+            WebDriverWait(driver, WAIT_TABLE_TIMEOUT).until(
+                EC.presence_of_element_located((By.TAG_NAME, "table"))
+            )
+        except TimeoutException:
+            break
+
+        html = driver.page_source
+        df = pick_history_table_from_html(html)
+
+        if df.empty:
+            # nếu page 1 rỗng thì coi như mã này không có hoặc bị chặn -> dừng sớm
+            if page == 1:
+                return False, inserted_total, dup_total
+            break
+
+        got_any = True
+
+        docs = df_to_docs(df, symbol, page, url)
+        ins, dup = upsert_many(coll, docs)
+        inserted_total += ins
+        dup_total += dup
+
+        print(f"    page={page:02d} docs={len(docs)} inserted={ins} dup~={dup}")
+
+        time.sleep(random.uniform(0.8, 1.6))
+
+    return got_any, inserted_total, dup_total
+
+
+def main():
+    p = resolve_symbols_file(SYMBOLS_XLSX)
+    symbols_df = pd.read_excel(p, sheet_name=SYMBOLS_SHEET)
+    symbols = symbols_df[SYMBOL_COL].dropna().astype(str).unique().tolist()
+
+    coll = get_collection()
+    driver = build_driver(headless=False)
+
+    symbols_with_data = 0
+    inserted_all = 0
+    dup_all = 0
+
+    try:
+        for i, sym in enumerate(symbols, 1):
+            print(f"[{i}/{len(symbols)}] {sym}")
+
+            ok, ins, dup = crawl_symbol_pages(
+                driver, sym, START_DATE, END_DATE, MAX_PAGES_PER_SYMBOL, coll
+            )
+
+            if ok:
+                symbols_with_data += 1
+            inserted_all += ins
+            dup_all += dup
+
+            print(f"  => ok={ok} | symbols_with_data={symbols_with_data} | inserted_all={inserted_all} | dup~={dup_all}")
+
+            time.sleep(random.uniform(0.8, 1.8))
+
+    finally:
+        driver.quit()
+
+    print("DONE.")
+    print("symbols_with_data =", symbols_with_data)
+    print("inserted_all =", inserted_all, "| dup~ =", dup_all)
+
+
+if __name__ == "__main__":
+    main()
